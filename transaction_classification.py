@@ -243,27 +243,56 @@ def _map_table_columns(header_row):
 _MONEY_RE = re.compile(r"^\(?[\d,]+\.\d{1,2}\)?$")
 _CURRENCY_PREFIX_RE = re.compile(r"^[₹$]\s*|^(rs\.?|inr)\s*", re.IGNORECASE)
 _TRAILING_LABEL_RE = re.compile(r"\s*(cr|dr)\.?$", re.IGNORECASE)
+# Some banks wrap the Dr/Cr tag in its own parens instead of appending it
+# bare, e.g. "249.00 (Dr)" / "1,396.60 (Cr)". Checked and stripped BEFORE
+# the bare-negative-parens check below, since here the parens wrap the tag,
+# not the number -- treating them as a negative-number marker would corrupt
+# the value (and leave the un-strippable "(Dr)"/"(Cr)" behind, so the row
+# used to just get silently dropped).
+_PARENTHESIZED_LABEL_RE = re.compile(r"\s*\((cr|dr)\.?\)\s*$", re.IGNORECASE)
 
-def _clean_amount(cell):
-    """Handles plain numbers as well as bank-formatted variants:
-    '₹ 1,186.69', 'Rs.1,186.69', 'INR 1186.69', '1,186.69 Cr', '(100.00)'."""
+def _clean_amount_with_direction(cell):
+    """Like _clean_amount, but also returns the DEBIT/CREDIT direction when
+    the cell itself carries a Dr/Cr tag (bare trailing or parenthesized) --
+    e.g. '249.00 (Dr)', '1,186.69 Cr'. Returns (value, direction), where
+    direction is None when the cell carries no such tag."""
     if not cell:
-        return None
+        return None, None
     text = str(cell).strip().replace("\xa0", " ").replace("\u200b", "")
     if not text:
-        return None
+        return None, None
     text = _CURRENCY_PREFIX_RE.sub("", text).strip()
-    text = _TRAILING_LABEL_RE.sub("", text).strip()
+
+    direction = None
+    paren_label = _PARENTHESIZED_LABEL_RE.search(text)
+    if paren_label:
+        direction = "DEBIT" if paren_label.group(1).lower() == "dr" else "CREDIT"
+        text = _PARENTHESIZED_LABEL_RE.sub("", text).strip()
+    else:
+        trailing_label = _TRAILING_LABEL_RE.search(text)
+        if trailing_label:
+            direction = "DEBIT" if trailing_label.group(1).lower() == "dr" else "CREDIT"
+        text = _TRAILING_LABEL_RE.sub("", text).strip()
+
     negative = text.startswith("(") and text.endswith(")")
     if negative:
         text = text[1:-1].strip()
     if not _MONEY_RE.match(text):
-        return None
+        return None, None
     try:
         value = float(text.replace(",", "").strip("()"))
-        return -value if negative else value
+        return (-value if negative else value), direction
     except ValueError:
-        return None
+        return None, None
+
+
+def _clean_amount(cell):
+    """Handles plain numbers as well as bank-formatted variants:
+    '₹ 1,186.69', 'Rs.1,186.69', 'INR 1186.69', '1,186.69 Cr', '(100.00)',
+    '249.00 (Dr)'. Direction-only callers should use
+    _clean_amount_with_direction instead."""
+    value, _ = _clean_amount_with_direction(cell)
+    return value
 
 
 # PARSING THE TABLE
@@ -286,12 +315,16 @@ def _parse_table_rows(rows: list, col_map: dict) -> List[Dict]:
         balance = _clean_amount(row[col_map['balance']]) if 'balance' in col_map and col_map['balance'] < len(row) else None
 
         # Alternate layout: single Amount column + Dr/Cr flag column,
-        # instead of split Debit/Credit columns -- a real, common variant
+        # instead of split Debit/Credit columns -- a real, common variant.
+        # Some banks fold the flag INTO the amount cell itself instead of a
+        # separate column, e.g. "249.00 (Dr)" or "1,186.69 Cr" -- that tag,
+        # when present, is a direct signal from the source cell and takes
+        # priority over a separate drcr column or guessing from narration.
         if debit is None and credit is None and 'amount' in col_map and col_map['amount'] < len(row):
-            amount = _clean_amount(row[col_map['amount']])
+            amount, tag_direction = _clean_amount_with_direction(row[col_map['amount']])
             if amount is not None:
-                direction = 'UNKNOWN'
-                if 'drcr' in col_map and col_map['drcr'] < len(row):
+                direction = tag_direction or 'UNKNOWN'
+                if direction == 'UNKNOWN' and 'drcr' in col_map and col_map['drcr'] < len(row):
                     direction = _infer_direction_from_flag(row[col_map['drcr']])
                 if direction == 'UNKNOWN':
                     direction = _infer_direction_from_narration(narration)
