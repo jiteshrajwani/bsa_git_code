@@ -96,4 +96,18 @@ else:
     )
     print(f"Synced task/job-level status for run_id={RUN_ID}: {run_info.get('state', {}).get('result_state')}")
 
+# THIS RUN'S STATEMENTS -- the whole point of this notebook: one row per
+# statement touched anywhere in this run_id's pipeline, all stage statuses
+# together, plus (for a real job run) the job/task-level result synced
+# above. This is the authoritative "what happened to the PDF(s) I just ran"
+# view -- everything upstream only sees its own stage.
+print(f"=== pipeline run summary (run_id={RUN_ID}) ===")
+display(
+    spark.table(TBL_PIPELINE_LOG)
+    .filter(F.col("run_id") == RUN_ID)
+)
+
+# OVERALL TABLE HEALTH -- full log, small and already run-level, kept for
+# historical/cross-run context
+print("=== bsa_pipeline_log full history ===")
 display(spark.table(TBL_PIPELINE_LOG))

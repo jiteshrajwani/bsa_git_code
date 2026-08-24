@@ -104,6 +104,25 @@ try:
     # a no-op anyway, so it's intentionally omitted here
     print(f"Wrote features for {row_count} new statement(s) -> {TBL_GOLD_ACCOUNT_FEATURES}")
 
+    # THIS RUN'S STATEMENTS -- scoped to the statement_hashes this run
+    # actually (re)merged into Gold, not the whole table's history.
+    print(f"=== merge_feature_engineering run summary (run_id={RUN_ID}) ===")
+    display(
+        spark.table(TBL_GOLD_ACCOUNT_FEATURES)
+        .join(new_eligible, on="statement_hash", how="inner")
+        .orderBy(F.col("computed_at").desc())
+    )
+
+    # OVERALL TABLE HEALTH -- small aggregate for context, not a substitute
+    # for the per-run view above
+    print("=== bsa_account_features overall bank_format breakdown ===")
+    display(
+        spark.table(TBL_GOLD_ACCOUNT_FEATURES)
+        .groupBy("bank_format")
+        .agg(F.count("*").alias("statement_count"))
+        .orderBy(F.col("statement_count").desc())
+    )
+
 except Exception as e:
     duration = round(time.time() - t0, 3)
     log_pipeline_stage(spark, "merge", new_eligible.select(

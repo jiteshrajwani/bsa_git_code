@@ -64,3 +64,26 @@ else:
     invalidate_downstream("pdf_extraction", staged_df.select("statement_hash"))
 
     print(f"Bronze backfill re-extracted {row_count} statement(s) in {TBL_BRONZE_EXTRACTION}")
+
+# THIS RUN'S STATEMENTS -- scoped to what bronze_backfill actually touched
+# in this job run (empty when nothing was eligible for reprocessing).
+print(f"=== bronze_backfill run summary (run_id={RUN_ID}) ===")
+display(
+    spark.table(TBL_PIPELINE_LOG)
+    .filter(F.col("run_id") == RUN_ID)
+    .select(
+        "statement_hash", "source_path",
+        "pdf_extraction_status", "pdf_extraction_duration_sec", "pdf_extraction_error",
+        "pdf_extraction_attempt_count",
+    )
+)
+
+# OVERALL TABLE HEALTH -- small aggregate for context
+print("=== bsa_statement_extraction_raw overall health (route x error presence) ===")
+display(
+    spark.table(TBL_BRONZE_EXTRACTION)
+    .withColumn("has_error", F.col("extraction_error").isNotNull())
+    .groupBy("route", "has_error")
+    .count()
+    .orderBy(F.col("count").desc())
+)

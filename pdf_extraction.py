@@ -98,6 +98,34 @@ query.awaitTermination()
 
 # COMMAND ----------
 
+# THIS RUN'S STATEMENTS -- scoped to what pdf_extraction actually touched
+# in this job run, keyed off bsa_pipeline_log.run_id (stamped by
+# log_pipeline_stage inside process_batch for every batch processed here).
+# Answers "what happened to the PDF(s) I just uploaded/ran," not "what does
+# the whole Bronze table look like historically."
+print(f"=== pdf_extraction run summary (run_id={RUN_ID}) ===")
+display(
+    spark.table(TBL_PIPELINE_LOG)
+    .filter(col("run_id") == RUN_ID)
+    .select(
+        "statement_hash", "source_path",
+        "pdf_extraction_status", "pdf_extraction_duration_sec", "pdf_extraction_error",
+        "pdf_extraction_attempt_count",
+    )
+)
+
+# OVERALL TABLE HEALTH -- small aggregate for context, not a substitute for
+# the per-run view above
+print("=== bsa_statement_extraction_raw overall health (route x error presence) ===")
+display(
+    spark.table(TBL_BRONZE_EXTRACTION)
+    .withColumn("has_error", col("extraction_error").isNotNull())
+    .groupBy("route", "has_error")
+    .count()
+    .orderBy(col("count").desc())
+)
+
+print("=== bsa_statement_extraction_raw most recent 20 (any run) ===")
 display(
     spark.table(TBL_BRONZE_EXTRACTION)
     .select("statement_hash", "bank_format", "num_pages", "extraction_confidence", "route", "extraction_error")

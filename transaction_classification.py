@@ -72,6 +72,28 @@ _SUMMARY_SKIP_RE = re.compile(
 )
 
 
+# Matches an amount immediately followed by a bare or parenthesized Dr/Cr
+# tag, e.g. "249.00 (Dr)", "1,396.60 (Cr)", "1,186.69 Cr" -- lets the block
+# parser see the SAME direction signal _clean_amount_with_direction uses for
+# table cells, instead of only guessing direction from narration keywords.
+_AMOUNT_WITH_TAG_RE = re.compile(
+    r"([\d,]+\.\d{2})\s*\(?\s*(cr|dr)\.?\)?", re.IGNORECASE
+)
+
+
+def _tag_directions_for_amounts(line: str, amounts: List[str]) -> Dict[str, str]:
+    """For each amount string found in `line`, look up the Dr/Cr tag
+    immediately following it (if any) and return {amount: 'DEBIT'/'CREDIT'}.
+    Amounts with no adjacent tag are simply absent from the result."""
+    directions = {}
+    for amt, tag in _AMOUNT_WITH_TAG_RE.findall(line):
+        directions[amt] = "DEBIT" if tag.lower() == "dr" else "CREDIT"
+    # findall on _AMOUNT_RE can normalize differently (e.g. no dedup) than
+    # _AMOUNT_WITH_TAG_RE -- match back onto the exact strings _AMOUNT_RE
+    # returned so callers can key off those directly
+    return {a: directions[a] for a in amounts if a in directions}
+
+
 # FINALIZING THE BLOCK FOR TABLES
 def _finalize_block(block_lines: List[str]) -> Dict:
     summary_idx = summary_date = summary_amounts = None
@@ -93,14 +115,19 @@ def _finalize_block(block_lines: List[str]) -> Dict:
     #     other_lines = [l for i, l in enumerate(block_lines) if i != summary_idx]
     #     narration = re.sub(r"\s+", " ", " ".join([*other_lines, inline_narration])).strip()
 
+    tag_directions = {}
     if summary_idx is not None:
         summary_line = block_lines[summary_idx]
+        # capture any amount->direction tag BEFORE the amounts get stripped
+        # out of the line below, same signal _clean_amount_with_direction
+        # uses for table cells (e.g. "249.00 (Dr)", "1,396.60 Cr")
+        tag_directions = _tag_directions_for_amounts(summary_line, summary_amounts)
         # strip EVERY date occurence on the top line, not just the first match
         # -- some bank repeats value date/post date on the post line and, a
         # leftover second date otherwise pulls out the narration
         remainder = _DATE_RE.sub(" ",summary_line)
         for amt in summary_amounts:
-            remainder = re.sub(re.escape(amt) + r"\s*(cr|dr)?\b"," ",remainder,flags=re.IGNORECASE  )
+            remainder = re.sub(re.escape(amt) + r"\s*\(?\s*(cr|dr)\.?\)?\s*"," ",remainder,flags=re.IGNORECASE  )
         inline_narration = re.sub(r"\s+"," ",remainder).strip(" -/:")
         other_lines = [l for i, l in enumerate(block_lines) if i != summary_idx]
         narration = re.sub(r"\s+", " ", " ".join([inline_narration,*other_lines])).strip()
@@ -139,7 +166,12 @@ def _finalize_block(block_lines: List[str]) -> Dict:
     txn_amount = float(summary_amounts[-2].replace(",", "")) if len(summary_amounts) > 1 else None
 
     txn_type, txn_confidence = _classify_transaction_type(narration)
-    direction = _infer_direction_from_narration(narration)
+    # The txn-amount cell's own Dr/Cr tag (when present) is a direct signal
+    # from the source, and takes priority over guessing from narration --
+    # same precedence _parse_table_rows gives it for table cells.
+    direction = tag_directions.get(summary_amounts[-2]) if len(summary_amounts) > 1 else None
+    if not direction:
+        direction = _infer_direction_from_narration(narration)
     if direction == "UNKNOWN":
         CREDIT_LEANING = {"SALARY_CREDIT", "INTEREST", "REVERSAL", "CASH_DEPOSIT","REV"}
         direction = "CREDIT" if txn_type in CREDIT_LEANING else "DEBIT"
@@ -371,6 +403,97 @@ def _parse_table_rows(rows: list, col_map: dict) -> List[Dict]:
 
 
 
+def _table_cell_texts(table) -> List[str]:
+    """Every non-empty string cell in a table, flattened -- used to test
+    whether a 'table' pdfplumber returned is actually a garbled single/
+    few-column blob rather than a real row/column grid."""
+    texts = []
+    for row in table:
+        if not row:
+            continue
+        for cell in row:
+            if cell and str(cell).strip():
+                texts.append(str(cell))
+    return texts
+
+
+def _is_blob_table(table) -> bool:
+    """Detects the case pdfplumber sometimes produces on a page that has
+    extra non-tabular content above the real grid (a QR/banner block,
+    an account-details block, etc.): instead of a clean row-per-transaction
+    grid, the whole page comes back as ONE 'table' with only 1-2 columns,
+    where each cell is a giant \\n-joined blob of many transaction lines
+    squashed together. A real table (even a headerless continuation page)
+    has one row per transaction; a blob table has far fewer rows than the
+    number of date+amount pairs actually packed inside its cells."""
+    if not table:
+        return False
+    max_cols = max((len(row) for row in table if row), default=0)
+    if max_cols > 2:
+        return False
+    cell_texts = _table_cell_texts(table)
+    packed_txn_lines = sum(
+        1 for text in cell_texts for line in text.split("\n")
+        if _DATE_RE.search(line) and _AMOUNT_RE.findall(line)
+    )
+    # more than one txn-looking line packed into a handful of wide cells --
+    # a real (even headerless) table would already have split these into
+    # separate rows instead of separate \n's inside one cell
+    return packed_txn_lines > 1 and packed_txn_lines > len(table)
+
+
+# A serial-number column ("S.No") glued to the front of each squashed line
+# is a common convention in exactly this kind of blob (see the bank example
+# that motivated this recovery path: "1 18/07/2025 X80073901 UPIAR/...").
+# When present, it's a much sharper block boundary than _parse_lines' generic
+# Chq/Ref/summary-line heuristics -- those assume real line-per-field
+# wrapping, not one giant multi-record blob, and without this presplit they
+# merge unrelated transactions (and leftover header/footer text) into a
+# single narration.
+_SERIAL_TXN_START_RE = re.compile(
+    r"(?m)^\s*\d{1,5}\s+(?=(?:" + "|".join(DATE_PATTERNS) + r"))"
+)
+
+
+def _split_blob_into_records(blob_text: str) -> List[str]:
+    """Split a squashed multi-transaction blob into one chunk per
+    transaction, using the leading 'S.No <date>' marker as the boundary when
+    present. Falls back to returning the whole blob as a single chunk (which
+    _parse_lines' own block detection then handles as before) when no such
+    marker is found, e.g. a blob that isn't S.No-prefixed."""
+    starts = [m.start() for m in _SERIAL_TXN_START_RE.finditer(blob_text)]
+    if len(starts) < 2:
+        return [blob_text]
+    chunks = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(blob_text)
+        chunks.append(blob_text[start:end])
+    return chunks
+
+
+def _recover_blob_table(table) -> List[Dict]:
+    """A table pdfplumber mis-detected as one/two wide columns instead of a
+    real grid still has the actual transaction text -- just squashed with
+    \\n's inside its cells instead of split into rows. Flatten every cell's
+    text back into lines, split it into one chunk per transaction where a
+    serial-number marker allows it, and hand each chunk to the same
+    line-based parser used for statements with no detected table at all --
+    so a page that fails table detection doesn't silently lose its
+    transactions, and doesn't have unrelated records/header/footer text
+    bleed into one another either."""
+    lines = []
+    for text in _table_cell_texts(table):
+        lines.extend(text.split("\n"))
+    recovered_text = "\n".join(lines)
+
+    rows = []
+    for chunk in _split_blob_into_records(recovered_text):
+        rows.extend(_parse_lines(chunk))
+    for r in rows:
+        r["classification_method"] = "raw_text_block_recovered"
+    return rows
+
+
 def _parse_tables(tables_json: str) -> List[Dict]:
     parsed = []
     if not tables_json:
@@ -400,17 +523,55 @@ def _parse_tables(tables_json: str) -> List[Dict]:
             col_map = last_good_col_map
             data_rows = table
         else:
-            continue  # no header seen anywhere yet in this document
+            # No header ever seen yet in this document -- most likely
+            # because THIS is the very first page and it failed table
+            # detection entirely (e.g. a QR/account-details banner above
+            # the real grid confused pdfplumber's line detection), so
+            # there's no last_good_col_map to fall back on either. Rather
+            # than silently dropping this page's transactions, check
+            # whether it's a garbled blob carrying real transaction text
+            # squashed into a couple of wide cells, and recover it via the
+            # same regex line-parser used for tableless statements.
+            if _is_blob_table(table):
+                parsed.extend(_recover_blob_table(table))
+            continue
 
         parsed.extend(_parse_table_rows(data_rows, col_map))
 
     return parsed
+
+
+def _txn_signature(txn: Dict):
+    """(date_raw, rounded balance) -- stable enough to dedupe/reconcile the
+    same real-world transaction seen via two different parse paths (table
+    grid vs. raw-text blob), without requiring an exact narration match
+    (whitespace/line-join differences make narration text an unreliable key
+    across the two paths)."""
+    bal = txn.get("running_balance")
+    return (txn.get("txn_date_raw"), round(bal, 2) if bal is not None else None)
+
 
 # PARSING THE TRANSACTION VALUE
 def _parse_transactions(raw_text: str, tables_json: str, words_json: str = None) -> List[Dict]:
     rows = _parse_tables(tables_json)
     if not rows:
         rows = _parse_lines(raw_text)
+    else:
+        # Hardening pass: table detection can silently drop a page (see
+        # _is_blob_table above for the known failure mode) without ever
+        # returning zero rows overall -- so "rows is non-empty" alone isn't
+        # proof nothing was lost. Cross-check against a full line-based
+        # parse of raw_text and backfill any transaction whose (date,
+        # balance) signature appears there but not in the table-derived
+        # rows. Only additions are possible here -- nothing already in
+        # `rows` is ever removed or overwritten by this pass.
+        table_signatures = {_txn_signature(r) for r in rows}
+        for line_txn in _parse_lines(raw_text):
+            sig = _txn_signature(line_txn)
+            if sig not in table_signatures and sig != (None, None):
+                line_txn["classification_method"] = "raw_text_block_backfill"
+                rows.append(line_txn)
+                table_signatures.add(sig)
     for i, r in enumerate(rows, start=1):
         r['line_no'] = i
     return rows
@@ -514,6 +675,15 @@ bronze_cpu = (
 # STAGE_LOGIC_VERSIONS['classification'] in 00_config
 bronze_cpu_eligible = get_eligible_statements("classification", bronze_cpu)
 
+# Captured NOW, before log_pipeline_stage()/invalidate_downstream() below
+# write anything -- those calls update bsa_pipeline_log for exactly these
+# statements, so re-evaluating bronze_cpu_eligible (a lazy DataFrame) AFTER
+# they run would re-run get_eligible_statements() against the NEW state and
+# find these same statements no-longer-eligible, misreporting "0
+# statement(s)" in the summary print below even on a run that classified
+# hundreds of lines.
+eligible_count = bronze_cpu_eligible.count()
+
 raw_output_df = bronze_cpu_eligible.mapInPandas(classify_partition, schema=CLASSIFICATION_SCHEMA)
 
 # materialize once via staging (serverless has no .cache()/.persist()) --
@@ -562,9 +732,25 @@ log_pipeline_stage(spark, "classification", log_rows)
 # validation to redo its work
 invalidate_downstream("classification", touched_hashes)
 
-print(f"Classified {row_count} transaction line(s) from {bronze_cpu_eligible.count()} statement(s) -> {TBL_SILVER_TRANSACTIONS}")
+print(f"Classified {row_count} transaction line(s) from {eligible_count} statement(s) -> {TBL_SILVER_TRANSACTIONS}")
 
+# THIS RUN'S STATEMENTS -- scoped to the statement_hashes this run actually
+# wrote fresh classification output for, not the whole table's history.
+print(f"=== transaction_classification run summary (run_id={RUN_ID}) ===")
+display(
+    spark.table(TBL_SILVER_TRANSACTIONS)
+    .join(touched_hashes, on="statement_hash", how="inner")
+    .groupBy("statement_hash", "bank_format")
+    .agg(
+        F.count("*").alias("line_count"),
+        F.sum(F.when(col("txn_type") == "OTHER", 1).otherwise(0)).alias("unclassified_other_count"),
+    )
+    .orderBy(col("statement_hash"))
+)
 
+# OVERALL TABLE HEALTH -- small aggregate for context, not a substitute for
+# the per-run view above
+print("=== bsa_classified_transactions overall txn_type breakdown ===")
 display(
     spark.table(TBL_SILVER_TRANSACTIONS)
     .groupBy('txn_type')

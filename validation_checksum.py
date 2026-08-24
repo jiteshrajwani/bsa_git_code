@@ -172,7 +172,22 @@ invalidate_downstream("validation", validation_results.select("statement_hash"))
 
 print(f"Validated {row_count} statement(s) -> {TBL_SILVER_VALIDATED}")
 
+# THIS RUN'S STATEMENTS -- scoped to the statement_hashes this run actually
+# (re)validated, not the whole table's history.
+print(f"=== validation_checksum run summary (run_id={RUN_ID}) ===")
+display(
+    spark.table(TBL_SILVER_VALIDATED)
+    .join(eligible_hashes, on="statement_hash", how="inner")
+    .select(
+        "statement_hash", "total_lines", "reconciled_lines", "mismatch_count",
+        "validation_status", "validation_notes",
+    )
+    .orderBy(col("statement_hash"))
+)
 
+# OVERALL TABLE HEALTH -- small aggregate for context, not a substitute for
+# the per-run view above
+print("=== bsa_validated_transactions overall validation_status breakdown ===")
 display(
     spark.table(TBL_SILVER_VALIDATED)
     .groupBy('validation_status')
