@@ -80,6 +80,14 @@ try:
     staged_features_df = spark.table(TBL_GOLD_STAGING)
     row_count = staged_features_df.count()
     duration = round(time.time() - t0, 3)
+    # Captured NOW, from the staged/materialized output -- NOT re-derived
+    # from new_eligible down at display time. new_eligible is a lazy
+    # DataFrame over bsa_pipeline_log; log_pipeline_stage() below overwrites
+    # this exact stage's status for these exact statements, so
+    # re-evaluating new_eligible AFTER that call would find them
+    # no-longer-eligible and make the run-summary display show 0 rows even
+    # on a run that wrote fresh Gold features.
+    touched_hashes = staged_features_df.select("statement_hash").distinct()
 
     # a statement can now be RE-merged (not just newly merged), so this
     # needs an update branch alongside insert, not insert-only
@@ -109,7 +117,7 @@ try:
     print(f"=== merge_feature_engineering run summary (run_id={RUN_ID}) ===")
     display(
         spark.table(TBL_GOLD_ACCOUNT_FEATURES)
-        .join(new_eligible, on="statement_hash", how="inner")
+        .join(touched_hashes, on="statement_hash", how="inner")
         .orderBy(F.col("computed_at").desc())
     )
 

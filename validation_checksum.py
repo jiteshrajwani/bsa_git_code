@@ -150,6 +150,14 @@ validation_results = (
 )
 
 row_count = validation_results.count()
+# Captured NOW, from the staged/materialized results -- NOT re-derived from
+# eligible_hashes down at display time. eligible_hashes is a lazy DataFrame
+# over bsa_pipeline_log; log_pipeline_stage() below overwrites this exact
+# stage's status for these exact statements, so re-evaluating eligible_hashes
+# AFTER that call would re-run get_eligible_statements() against the NEW
+# state and find them no-longer-eligible, making the run-summary display
+# show 0 rows even on a run that validated hundreds of lines.
+touched_hashes = validation_results.select("statement_hash").distinct()
 
 # a statement can now be RE-validated (not just newly validated), so this
 # needs an update branch alongside insert, not insert-only
@@ -177,7 +185,7 @@ print(f"Validated {row_count} statement(s) -> {TBL_SILVER_VALIDATED}")
 print(f"=== validation_checksum run summary (run_id={RUN_ID}) ===")
 display(
     spark.table(TBL_SILVER_VALIDATED)
-    .join(eligible_hashes, on="statement_hash", how="inner")
+    .join(touched_hashes, on="statement_hash", how="inner")
     .select(
         "statement_hash", "total_lines", "reconciled_lines", "mismatch_count",
         "validation_status", "validation_notes",

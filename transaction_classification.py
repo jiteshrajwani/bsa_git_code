@@ -551,6 +551,68 @@ def _txn_signature(txn: Dict):
     return (txn.get("txn_date_raw"), round(bal, 2) if bal is not None else None)
 
 
+_DATE_PARSE_FORMATS = (
+    "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y", "%d.%m.%y",
+    "%d %b %Y", "%d-%b-%Y", "%d/%b/%Y", "%d %b %y", "%d-%b-%y", "%d/%b/%y",
+    "%d %B %Y", "%d-%B-%Y", "%d/%B/%Y",
+    "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+)
+
+
+def _parse_txn_date(date_raw):
+    """Best-effort parse of txn_date_raw into a real date for ordering.
+    Returns None on failure -- callers must NOT assume every row gets a
+    usable key back, since misparsing a date wrongly is worse than leaving
+    a row unsorted (see _order_rows_by_date below)."""
+    if not date_raw:
+        return None
+    import datetime
+    text = str(date_raw).strip()
+    for fmt in _DATE_PARSE_FORMATS:
+        try:
+            return datetime.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _order_rows_by_date(rows: List[Dict]) -> List[Dict]:
+    """Table parsing, blob recovery, and the raw-text backfill pass can each
+    contribute rows in a different relative order (blob-recovered and
+    backfilled rows are appended, not interleaved) -- but validation's
+    balance-chain reconciliation sorts strictly by line_no and depends on
+    consecutive rows actually being consecutive transactions. Re-sort the
+    dated rows (stable, so same-day rows keep whatever relative order they
+    arrived in) before line_no gets assigned, so line_no reflects
+    chronological/statement order rather than "which parse path found it."
+
+    Rows whose date couldn't be parsed are left OUT of the reordering
+    entirely and appended after the dated ones in their original relative
+    order -- interleaving them by original index would misplace them
+    relative to the now-reordered dated rows, and validation can't
+    reconcile an undated row's balance against its neighbour anyway, so
+    where exactly it lands matters far less than not corrupting the dated
+    rows' order.
+
+    Direction (newest-first vs. oldest-first) is read from the first two
+    DATED rows in the ORIGINAL arrival order, not from any already-reordered
+    view -- using an already-scrambled order to infer direction would just
+    encode whatever bug scrambled it in the first place."""
+    dated = [(_parse_txn_date(r.get("txn_date_raw")), r) for r in rows]
+    parsed_only = [(d, r) for d, r in dated if d is not None]
+    undated = [r for d, r in dated if d is None]
+
+    if len(parsed_only) < 2:
+        return rows  # not enough signal to safely reorder anything
+
+    first_date = parsed_only[0][0]
+    last_original_date = parsed_only[-1][0]
+    descending = first_date >= last_original_date
+
+    parsed_only.sort(key=lambda item: item[0].toordinal(), reverse=descending)
+    return [r for _, r in parsed_only] + undated
+
+
 # PARSING THE TRANSACTION VALUE
 def _parse_transactions(raw_text: str, tables_json: str, words_json: str = None) -> List[Dict]:
     rows = _parse_tables(tables_json)
@@ -572,6 +634,7 @@ def _parse_transactions(raw_text: str, tables_json: str, words_json: str = None)
                 line_txn["classification_method"] = "raw_text_block_backfill"
                 rows.append(line_txn)
                 table_signatures.add(sig)
+    rows = _order_rows_by_date(rows)
     for i, r in enumerate(rows, start=1):
         r['line_no'] = i
     return rows
