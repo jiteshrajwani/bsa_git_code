@@ -94,8 +94,8 @@ from pyspark.sql import Row
 # deletion, no separate backfill script to remember to run.
 STAGE_LOGIC_VERSIONS = {
     "pdf_extraction": 1,
-    "classification": 7,
-    "validation": 2,
+    "classification": 8,
+    "validation": 3,
     "merge": 1,
 }
 

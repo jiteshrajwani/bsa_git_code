@@ -494,14 +494,28 @@ def _recover_blob_table(table) -> List[Dict]:
     return rows
 
 
-def _parse_tables(tables_json: str) -> List[Dict]:
-    parsed = []
+def _parse_tables(tables_json: str):
+    """Returns (main_rows, extra_rows).
+
+    main_rows are ordinary table-grid rows, in the SAME order pdfplumber
+    read them in -- page by page, row by row, top to bottom. That order is
+    already correct and must never be re-derived from anything else (dates
+    included): it's the one thing we know matches the bank's own listed
+    transaction sequence, which is what the balance-chain check in
+    validation actually depends on.
+
+    extra_rows are rows recovered from a garbled blob table (see
+    _is_blob_table) -- these did NOT come from the normal grid, so their
+    position relative to main_rows isn't known yet and the caller is
+    responsible for placing them correctly (see _splice_extra_rows)."""
+    main_rows = []
+    extra_rows = []
     if not tables_json:
-        return parsed
+        return main_rows, extra_rows
     try:
         tables = json.loads(tables_json)
     except Exception:
-        return parsed
+        return main_rows, extra_rows
 
     last_good_col_map = None
     for table in tables:
@@ -519,7 +533,9 @@ def _parse_tables(tables_json: str) -> List[Dict]:
             # page whose header didn't repeat, or a page-boundary artifact
             # corrupted row 0. Reuse the last known-good mapping and treat
             # every row as data; the per-row date check above filters out
-            # any stray/garbage rows automatically.
+            # any stray/garbage rows automatically. Still part of the
+            # trusted main grid sequence -- pdfplumber read this table in
+            # true page order same as any other.
             col_map = last_good_col_map
             data_rows = table
         else:
@@ -531,14 +547,17 @@ def _parse_tables(tables_json: str) -> List[Dict]:
             # than silently dropping this page's transactions, check
             # whether it's a garbled blob carrying real transaction text
             # squashed into a couple of wide cells, and recover it via the
-            # same regex line-parser used for tableless statements.
+            # same regex line-parser used for tableless statements. These
+            # rows are NOT part of the trusted grid order (the whole reason
+            # they needed recovery is that table detection failed on this
+            # page), so they're kept separate and spliced in by date later.
             if _is_blob_table(table):
-                parsed.extend(_recover_blob_table(table))
+                extra_rows.extend(_recover_blob_table(table))
             continue
 
-        parsed.extend(_parse_table_rows(data_rows, col_map))
+        main_rows.extend(_parse_table_rows(data_rows, col_map))
 
-    return parsed
+    return main_rows, extra_rows
 
 
 def _txn_signature(txn: Dict):
@@ -576,65 +595,101 @@ def _parse_txn_date(date_raw):
     return None
 
 
-def _order_rows_by_date(rows: List[Dict]) -> List[Dict]:
-    """Table parsing, blob recovery, and the raw-text backfill pass can each
-    contribute rows in a different relative order (blob-recovered and
-    backfilled rows are appended, not interleaved) -- but validation's
-    balance-chain reconciliation sorts strictly by line_no and depends on
-    consecutive rows actually being consecutive transactions. Re-sort the
-    dated rows (stable, so same-day rows keep whatever relative order they
-    arrived in) before line_no gets assigned, so line_no reflects
-    chronological/statement order rather than "which parse path found it."
+def _infer_main_direction(main_rows: List[Dict]):
+    """Scans main_rows (already in trusted, correct document order -- see
+    _parse_tables) for the first pair of CONSECUTIVE rows with two different
+    parseable dates, and returns True if that statement runs newest-first
+    (descending), False if oldest-first (ascending), None if no such pair
+    exists (e.g. every row shares one date, or fewer than 2 rows have a
+    parseable date at all -- not enough signal to place anything by date).
 
-    Rows whose date couldn't be parsed are left OUT of the reordering
-    entirely and appended after the dated ones in their original relative
-    order -- interleaving them by original index would misplace them
-    relative to the now-reordered dated rows, and validation can't
-    reconcile an undated row's balance against its neighbour anyway, so
-    where exactly it lands matters far less than not corrupting the dated
-    rows' order.
+    Deliberately does NOT compare "first row vs last row of the whole
+    statement": a single far-apart comparison is one bad/misparsed row away
+    from getting the entire direction backwards. A local, consecutive,
+    different-dated pair is a much smaller, more reliable signal, and it's
+    only ever used to place a handful of EXTRA rows -- main_rows' own order
+    is never touched or re-derived from this."""
+    prev_date = None
+    for row in main_rows:
+        d = _parse_txn_date(row.get("txn_date_raw"))
+        if d is None:
+            continue
+        if prev_date is not None and d != prev_date:
+            return d < prev_date  # True: dates are decreasing => descending
+        prev_date = d
+    return None
 
-    Direction (newest-first vs. oldest-first) is read from the first two
-    DATED rows in the ORIGINAL arrival order, not from any already-reordered
-    view -- using an already-scrambled order to infer direction would just
-    encode whatever bug scrambled it in the first place."""
-    dated = [(_parse_txn_date(r.get("txn_date_raw")), r) for r in rows]
-    parsed_only = [(d, r) for d, r in dated if d is not None]
-    undated = [r for d, r in dated if d is None]
 
-    if len(parsed_only) < 2:
-        return rows  # not enough signal to safely reorder anything
+def _splice_extra_rows(main_rows: List[Dict], extra_rows: List[Dict]) -> List[Dict]:
+    """main_rows is the trusted, already-correctly-ordered sequence (see
+    _parse_tables) and is NEVER reordered here -- only extra_rows (blob
+    recovery / backfill additions, which didn't come from the normal grid
+    and so have no known position) get placed, each one individually, at
+    the point in main_rows where its own date fits.
 
-    first_date = parsed_only[0][0]
-    last_original_date = parsed_only[-1][0]
-    descending = first_date >= last_original_date
+    If main_rows is empty, or extra_rows have no comparable date signal
+    against it, they're appended at the end rather than guessed at --
+    matches the pre-existing behaviour for tableless statements and is
+    strictly safer than a wrong placement."""
+    if not extra_rows:
+        return main_rows
+    if not main_rows:
+        return main_rows + extra_rows
 
-    parsed_only.sort(key=lambda item: item[0].toordinal(), reverse=descending)
-    return [r for _, r in parsed_only] + undated
+    descending = _infer_main_direction(main_rows)
+    main_dates = [_parse_txn_date(r.get("txn_date_raw")) for r in main_rows]
+
+    result = list(main_rows)
+    result_dates = list(main_dates)
+    for extra in extra_rows:
+        d = _parse_txn_date(extra.get("txn_date_raw"))
+        if d is None or descending is None:
+            result.append(extra)
+            result_dates.append(None)
+            continue
+        # find the first position whose date is "past" this extra row's
+        # date (given the statement's own direction), and insert just
+        # before it -- everything already at result_dates[idx] and beyond
+        # stays exactly where it was
+        insert_at = len(result)
+        for idx, rd in enumerate(result_dates):
+            if rd is None:
+                continue
+            is_past = (rd < d) if descending else (rd > d)
+            if is_past:
+                insert_at = idx
+                break
+        result.insert(insert_at, extra)
+        result_dates.insert(insert_at, d)
+
+    return result
 
 
 # PARSING THE TRANSACTION VALUE
 def _parse_transactions(raw_text: str, tables_json: str, words_json: str = None) -> List[Dict]:
-    rows = _parse_tables(tables_json)
-    if not rows:
+    main_rows, extra_rows = _parse_tables(tables_json)
+    if not main_rows and not extra_rows:
         rows = _parse_lines(raw_text)
     else:
         # Hardening pass: table detection can silently drop a page (see
         # _is_blob_table above for the known failure mode) without ever
-        # returning zero rows overall -- so "rows is non-empty" alone isn't
-        # proof nothing was lost. Cross-check against a full line-based
-        # parse of raw_text and backfill any transaction whose (date,
-        # balance) signature appears there but not in the table-derived
-        # rows. Only additions are possible here -- nothing already in
-        # `rows` is ever removed or overwritten by this pass.
-        table_signatures = {_txn_signature(r) for r in rows}
+        # leaving BOTH main_rows and extra_rows empty -- so having some
+        # rows already isn't proof nothing was lost. Cross-check against a
+        # full line-based parse of raw_text and backfill any transaction
+        # whose (date, balance) signature appears there but not already
+        # covered. Only additions are possible here -- nothing already
+        # parsed is ever removed or overwritten by this pass. Backfilled
+        # rows are EXTRA (unknown position), same as blob-recovered ones.
+        known_signatures = {_txn_signature(r) for r in main_rows}
+        known_signatures.update(_txn_signature(r) for r in extra_rows)
         for line_txn in _parse_lines(raw_text):
             sig = _txn_signature(line_txn)
-            if sig not in table_signatures and sig != (None, None):
+            if sig not in known_signatures and sig != (None, None):
                 line_txn["classification_method"] = "raw_text_block_backfill"
-                rows.append(line_txn)
-                table_signatures.add(sig)
-    rows = _order_rows_by_date(rows)
+                extra_rows.append(line_txn)
+                known_signatures.add(sig)
+    if main_rows or extra_rows:
+        rows = _splice_extra_rows(main_rows, extra_rows)
     for i, r in enumerate(rows, start=1):
         r['line_no'] = i
     return rows
